@@ -55,6 +55,35 @@ static struct inode_operations assoofs_inode_ops = {
 };
 
 /*
+ *  Funcion auxiliar nos permite obtener la informacion persistente del inodo numero inode_no del superbloque sb
+ */
+struct assoofs_inode_info *assoofs_get_inode_info(struct super_block *sb, uint64_t inode_no){
+    //Accedemos a disco para leer el bloque que contiene el almacen de inodos
+    struct assoofs_inode_info *inode_info = NULL;
+    struct buffer_head *bh;
+    bh = sb_bread(sb, ASSOOFS_INODESTORE_BLOCK_NUMBER);   //Leemos bloque 1
+    inode_info = (struct assoofs_inode_info *)bh->b_data; //Hacemos conversion
+
+    //Recorrer el almacen de inodos en busca del inodo inode_no
+    struct assoofs_super_block_info *afs_sb = sb->s_fs_info; //Idea no tener que acceder siempre al bloque 0, lo guardamos en esta variable
+    struct assoofs_inode_info *buffer = NULL;
+    int i;
+
+    for (i = 0; i < afs_sb->inodes_count; i++) {      //Nada mas arrancar, num inodos es 2 (raiz y fich bienvenida)
+        if (inode_info->inode_no == inode_no) {
+            buffer = kmalloc(sizeof(struct assoofs_inode_info), GFP_KERNEL);
+            memcpy(buffer, inode_info, sizeof(*buffer));
+            break;
+        }
+        inode_info++;   //++ en puntero: incrementar tantos bytes como ocupe una variable y pasa a la segunda
+    }
+
+    //Liberamos recursos y devolvemos la informacion del inodo inode_no, si estaba en el almacen
+    brelse(bh);
+    return buffer;
+}
+
+/*
  * Esta función auxiliar nos permitirá obtener un puntero al inodo número ino del superbloque sb.
  */
 static struct inode *assoofs_get_inode(struct super_block *sb, int ino){
@@ -98,6 +127,7 @@ struct dentry *assoofs_lookup(struct inode *parent_inode, struct dentry *child_d
     struct assoofs_inode_info *parent_info = parent_inode->i_private;
     struct super_block *sb = parent_inode->i_sb;
     struct buffer_head *bh;
+    int i;
     bh = sb_bread(sb, parent_info->data_block_number); 
 
 
@@ -121,8 +151,187 @@ struct dentry *assoofs_lookup(struct inode *parent_inode, struct dentry *child_d
 }
 
 
+/*
+ *  Esta función auxiliar nos permitirá obtener un puntero a la información persistente de un inodo concreto
+ */
+struct assoofs_inode_info *assoofs_search_inode_info(struct super_block *sb, struct assoofs_inode_info *start, struct assoofs_inode_info *search){
+    uint64_t count = 0;
+    
+    while (start->inode_no != search->inode_no && count < ((struct assoofs_super_block_info *)sb->s_fs_info)->inodes_count) {
+        count++;
+        start++;
+    }
+
+    if(start->inode_no == search->inode_no){
+        return start;
+    }else{
+        return NULL;
+    }
+}
+
+/*
+ *  Esta función auxiliar nos permitirá actualizar en disco la información persistente de un inodo:
+ */
+int assoofs_save_inode_info(struct super_block *sb, struct assoofs_inode_info *inode_info){
+    struct buffer_head *bh;
+    struct assoofs_inode_info *inode_pos;
+
+    //Obtener de disco el almacén de inodos.
+    bh = sb_bread(sb, ASSOOFS_INODESTORE_BLOCK_NUMBER);
+
+    //Buscar los datos de inode info en el almacén. Para ello se recomienda utilizar una función auxiliar
+    inode_pos = assoofs_search_inode_info(sb, (struct assoofs_inode_info *)bh->b_data, inode_info);
+
+    //Actualizar el inodo, marcar el bloque como sucio y sincronizar.
+    memcpy(inode_pos, inode_info, sizeof(*inode_pos));
+    mark_buffer_dirty(bh);
+    sync_dirty_buffer(bh);
+    //brelse(bh);
+
+    return 0;
+}
+
+
+
+/*
+ *  Esta función auxiliar nos permitirá actualizar la información persistente del superbloque cuando hay un cambio
+ */
+void assoofs_save_sb_info(struct super_block *vsb){
+    //Leer de disco la información persistente del superbloque con sb bread y sobreescribir el campo b_data con la informacion en memoria:
+    struct buffer_head *bh; //Para grabar en disco
+    struct assoofs_super_block *sb = vsb->s_fs_info; // Información persistente del superbloque en memoria
+    bh = sb_bread(vsb, ASSOOFS_SUPERBLOCK_BLOCK_NUMBER); //Accedemos a disco
+    bh->b_data = (char *)sb; // Sobreescribo los datos de disco con la información en memoria
+
+    //Para que el cambio pase a disco, basta con marcar el buffer como sucio y sincronizar
+    mark_buffer_dirty(bh);
+    sync_dirty_buffer(bh);
+    brelse(bh);
+}
+
+/*
+ *  Esta función auxiliar nos permitirá guardar en disco la información persistente de un inodo nuevo
+ */
+void assoofs_add_inode_info(struct super_block *sb, struct assoofs_inode_info *inode){
+    struct assoofs_super_block_info *assoofs_sb = sb->s_fs_info;
+    uint64_t count;
+    struct buffer_head *bh;
+    struct assoofs_inode_info *inode_info;
+
+    //Acceder a la información persistente del superbloque (sb->s fs info) para obtener el contador de inodos (inodes count).
+    count = ((struct assoofs_super_block_info *)sb->s_fs_info)->inodes_count;
+
+    //Leer de disco el bloque que contiene el almacén de inodos.
+    bh = sb_bread(sb, ASSOOFS_INODESTORE_BLOCK_NUMBER); 
+
+    //Obtener un puntero al final del almacén y escribir un nuevo valor al final.
+    inode_info = (struct assoofs_inode_info *)bh->b_data;
+    inode_info += assoofs_sb->inodes_count;
+    memcpy(inode_info, inode, sizeof(struct assoofs_inode_info));   //Copia de mem la info del inodo y cuantos bytes se copian
+
+    //Para que los cambios persistan
+    mark_buffer_dirty(bh);
+    sync_dirty_buffer(bh);
+    //brelse(bh);
+
+
+    //Actualizar el contador de inodos de la informacion persistente del superbloque y guardar los cambios.
+    assoofs_sb->inodes_count++;
+    assoofs_save_sb_info(sb);
+}
+
+
+/*
+ *  Esta función auxiliar nos permitirá obtener un bloque libre:
+ */
+int assoofs_sb_get_a_freeblock(struct super_block *sb, uint64_t *block){
+    struct assoofs_super_block_info *assoofs_sb = sb->s_fs_info;
+    int i;
+
+    for (i = 2; i < ASSOOFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED; i++) //Desde 2, pues super y alm inodos (bloque 0 y 1)
+        if (assoofs_sb->free_blocks & (1 << i)) //comprobar bit del indice esta libre o no
+            break; // cuando aparece el primer bit 1 en free_block dejamos de recorrer el mapa de bits, i tiene la posición del primer bloque libre
+        
+    *block = i; // Escribimos el valor de i en la dirección de memoria indicada como segundo argumento en la función
+
+    if(i== ASSOOFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED){
+        printk(KERN_ERR "There are no more free blocks avalible\n");
+        return -1;
+    }
+
+    //Por último, hay que actualizar el valor de free blocks y guardar los cambios en el superbloque.
+    assoofs_sb->free_blocks &= ~(1 << i);
+    assoofs_save_sb_info(sb);
+    return 0;
+    
+}
+
+
 static int assoofs_create(struct inode *dir, struct dentry *dentry, umode_t mode, bool excl) {
     printk(KERN_INFO "New file request\n");
+
+    //Creamos un inodo, con algunas consideraciones:
+    struct inode *inode;
+    uint64_t count;
+    struct assoofs_inode_info *inode_info;
+
+    struct super_block *sb;
+    struct buffer_head *bh;
+
+    struct assoofs_inode_info *parent_inode_info;
+    struct assoofs_dir_record_entry *dir_contents;
+
+    /* ==== PARTE 1: ==== */
+    sb = dir->i_sb; // obtengo un puntero al superbloque desde dir
+    count = ((struct assoofs_super_block_info *)sb->s_fs_info)->inodes_count; // obtengo el número de inodos de la información persistente del superbloque
+    inode = new_inode(sb);
+    inode->i_ino = count + 1; // Asigno número al nuevo inodo a partir de count
+
+    if(count >= ASSOOFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED){
+        printk(KERN_ERR "Max number of objects supported by ASSOOFS has been reached\n");
+        return -1;
+    }
+ 
+    /*  Hay que guardar en el campo i private la información persistente del mismo (struct assoofs inode info). 
+        En este caso, no llamo a assoofs get inode info, se trata de un nuevo inodo y tengo que crearlo desde cero  */
+    inode_info = kmalloc(sizeof(struct assoofs_inode_info), GFP_KERNEL);
+    inode_info->inode_no = inode->i_ino;
+    inode_info->mode = mode; // El segundo mode me llega como argumento
+    inode_info->file_size = 0;
+    inode->i_private = inode_info;
+    inode_init_owner(inode, dir, mode);
+    d_add(dentry, inode);
+
+    //Para las operaciones sobre ficheros
+    inode->i_fop=&assoofs_file_operations;
+
+    //Hay que asignarle un bloque al nuevo inodo, por lo que habrá que consultar el mapa de bits del superbloque.
+    assoofs_sb_get_a_freeblock(sb, &inode_info->data_block_number); //Direccion donde se escribe el bloque del fichero
+
+    //Guardar la información persistente del nuevo inodo en disco
+    assoofs_add_inode_info(sb, inode_info);
+
+
+    /* ==== PARTE 2: ===== */
+    //Modificar el contenido del directorio padre, añadiendo una nueva entrada para el nuevo archivo o directorio. El nombre lo sacaremos del segundo parámetro.
+    parent_inode_info = dir->i_private; //Sacamos info persistente del padre 
+    bh = sb_bread(sb, parent_inode_info->data_block_number);  //Leemos el contenido del disco del bloque del dir padre
+
+    dir_contents = (struct assoofs_dir_record_entry *)bh->b_data;
+    dir_contents += parent_inode_info->dir_children_count; //Avanzar el puntero para llegar al final (fig, tercer bloque, final amarillo)
+    dir_contents->inode_no = inode_info->inode_no; // inode_info es la información persistente del inodo creado en el paso 2.
+
+    strcpy(dir_contents->filename, dentry->d_name.name);
+    mark_buffer_dirty(bh);  //Marcar como sucio
+    sync_dirty_buffer(bh);  //Volcar todos los cambios en bh a disco
+    brelse(bh);
+
+
+    /* ===== PÀRTE 3: ===== */
+    //Actualizar la información persistente del inodo padre indicando que ahora tiene un archivo más.
+    parent_inode_info->dir_children_count++;
+    assoofs_save_inode_info(sb, parent_inode_info); 
+
     return 0;
 }
 
@@ -137,36 +346,6 @@ static int assoofs_mkdir(struct inode *dir , struct dentry *dentry, umode_t mode
 static const struct super_operations assoofs_sops = {
     .drop_inode = generic_delete_inode,
 };
-
-
-/*
- *  Funcion auxiliar nos permite obtener la informacion persistente del inodo numero inode_no del superbloque sb
- */
-struct assoofs_inode_info *assoofs_get_inode_info(struct super_block *sb, uint64_t inode_no){
-    //Accedemos a disco para leer el bloque que contiene el almacen de inodos
-    struct assoofs_inode_info *inode_info = NULL;
-    struct buffer_head *bh;
-    bh = sb_bread(sb, ASSOOFS_INODESTORE_BLOCK_NUMBER);   //Leemos bloque 1
-    inode_info = (struct assoofs_inode_info *)bh->b_data; //Hacemos conversion
-
-    //Recorrer el almacen de inodos en busca del inodo inode_no
-    struct assoofs_super_block_info *afs_sb = sb->s_fs_info; //Idea no tener que acceder siempre al bloque 0, lo guardamos en esta variable
-    struct assoofs_inode_info *buffer = NULL;
-    int i;
-
-    for (i = 0; i < afs_sb->inodes_count; i++) {      //Nada mas arrancar, num inodos es 2 (raiz y fich bienvenida)
-        if (inode_info->inode_no == inode_no) {
-            buffer = kmalloc(sizeof(struct assoofs_inode_info), GFP_KERNEL);
-            memcpy(buffer, inode_info, sizeof(*buffer));
-            break;
-        }
-        inode_info++;   //++ en puntero: incrementar tantos bytes como ocupe una variable y pasa a la segunda
-    }
-
-    //Liberamos recursos y devolvemos la informacion del inodo inode_no, si estaba en el almacen
-    brelse(bh);
-    return buffer;
-}
 
 /*
  *  Inicialización del superbloque
