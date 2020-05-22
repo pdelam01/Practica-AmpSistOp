@@ -37,6 +37,8 @@ const struct file_operations assoofs_dir_operations = {
 
 static int assoofs_iterate(struct file *filp, struct dir_context *ctx) {
     printk(KERN_INFO "Iterate request\n");
+
+
     return 0;
 }
 
@@ -52,8 +54,69 @@ static struct inode_operations assoofs_inode_ops = {
     .mkdir = assoofs_mkdir,
 };
 
+/*
+ * Esta función auxiliar nos permitirá obtener un puntero al inodo número ino del superbloque sb.
+ */
+static struct inode *assoofs_get_inode(struct super_block *sb, int ino){
+    struct inode *inode;
+    struct assoofs_inode_info *inode_info;
+
+    //Obtener la información persistente del inodo ino
+    inode_info = assoofs_get_inode_info(sb, ino);
+
+    //Asignamos
+    inode=new_inode(sb);
+    inode->i_ino = ino; 
+    inode->i_sb = sb; 
+    inode->i_op = &assoofs_inode_ops; 
+
+    //Comprobamos valor f_op
+    if (S_ISDIR(inode_info->mode))
+        inode->i_fop = &assoofs_dir_operations;
+    else if (S_ISREG(inode_info->mode))
+        inode->i_fop = &assoofs_file_operations;
+    else
+        printk(KERN_ERR "Unknown inode type. Neither a directory nor a file.");
+
+    //Demas
+    inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode); 
+    inode->i_private = inode_info;
+
+    return inode;
+}
+
+
+/*
+ *  Esta función busca la entrada (struct dentry) con el nombre correcto (child dentry->d name.name)
+ *  en el directorio padre (parent inode). Se utiliza para recorrer y mantener el árbol de inodos.
+ */
+
 struct dentry *assoofs_lookup(struct inode *parent_inode, struct dentry *child_dentry, unsigned int flags) {
     printk(KERN_INFO "Lookup request\n");
+
+    //Accedemos al bloque de disco con el contenido del directorio apuntado por parent inode
+    struct assoofs_inode_info *parent_info = parent_inode->i_private;
+    struct super_block *sb = parent_inode->i_sb;
+    struct buffer_head *bh;
+    bh = sb_bread(sb, parent_info->data_block_number); 
+
+
+    /*  Recorrer el contenido del directorio buscando la entrada cuyo nombre se corresponda con el que buscamos. Si se localiza
+        la entrada, entonces tenemos construir el inodo correspondiente */
+    struct assoofs_dir_record_entry *record;
+    record = (struct assoofs_dir_record_entry *)bh->b_data;
+
+    for (i=0; i < parent_info->dir_children_count; i++) {
+        if (!strcmp(record->filename, child_dentry->d_name. name)) { //Se ejecuta cuando son iguales
+            struct inode *inode = assoofs_get_inode(sb, record->inode_no); // Función auxiliar que obtine la información de un inodo a partir de su número de inodo
+            inode_init_owner(inode, parent_inode, ((struct assoofs_inode_info *)inode->i_private)->mode);
+            d_add(child_dentry, inode); //Construye arbol de inodos en mem
+            return NULL;
+        }
+        record++;
+    }
+
+    printk(KERN_ERR "No inode found for the filename: [%s]\n", child_dentry->d_name.name);
     return NULL;
 }
 
@@ -84,19 +147,20 @@ struct assoofs_inode_info *assoofs_get_inode_info(struct super_block *sb, uint64
     struct assoofs_inode_info *inode_info = NULL;
     struct buffer_head *bh;
     bh = sb_bread(sb, ASSOOFS_INODESTORE_BLOCK_NUMBER);   //Leemos bloque 1
-    inode_info = (struct assoofs_inode_info *)bh->b_data;
+    inode_info = (struct assoofs_inode_info *)bh->b_data; //Hacemos conversion
 
     //Recorrer el almacen de inodos en busca del inodo inode_no
-    struct assoofs_super_block_info *afs_sb = sb->s_fs_info;
+    struct assoofs_super_block_info *afs_sb = sb->s_fs_info; //Idea no tener que acceder siempre al bloque 0, lo guardamos en esta variable
     struct assoofs_inode_info *buffer = NULL;
     int i;
-    for (i = 0; i < afs_sb->inodes_count; i++) {
+
+    for (i = 0; i < afs_sb->inodes_count; i++) {      //Nada mas arrancar, num inodos es 2 (raiz y fich bienvenida)
         if (inode_info->inode_no == inode_no) {
             buffer = kmalloc(sizeof(struct assoofs_inode_info), GFP_KERNEL);
             memcpy(buffer, inode_info, sizeof(*buffer));
             break;
         }
-        inode_info++;
+        inode_info++;   //++ en puntero: incrementar tantos bytes como ocupe una variable y pasa a la segunda
     }
 
     //Liberamos recursos y devolvemos la informacion del inodo inode_no, si estaba en el almacen
@@ -121,11 +185,15 @@ int assoofs_fill_super(struct super_block *sb, void *data, int silent) {
  
     // 2.- Comprobar los parámetros del superbloque
     if(assoofs_sb->magic!=ASSOOFS_MAGIC){
-	printk(KERN_ERR "Magic Number mismatch\n");
+	   printk(KERN_ERR "Magic Number mismatch\n");
+       brelse(bh);
+       return -1;
     } 
 
     if(assoofs_sb->block_size!=ASSOOFS_DEFAULT_BLOCK_SIZE){
-	printk(KERN_ERR "Block Size mismatch\n");
+	   printk(KERN_ERR "Block Size mismatch\n");
+       brelse(bh);
+       return -1;
     }
 
     // 3.- Escribir la información persistente leída del dispositivo de bloques en el superbloque sb, incluído el campo s_op con las operaciones que soporta.
@@ -154,10 +222,11 @@ int assoofs_fill_super(struct super_block *sb, void *data, int silent) {
     sb->s_root = d_make_root(root_inode);
     if(!sb->s_root){
         brelse(bh);
-        return -ENOMEM;
+        return -1;
     }
 
-    brelse(bh); //LIberamos recursos
+    //LIberamos recursos
+    brelse(bh); 
     return 0;
 }
 
