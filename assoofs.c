@@ -6,6 +6,8 @@
 #include <linux/slab.h>         /* kmem_cache            */
 #include "assoofs.h"
 
+int assoofs_save_inode_info(struct super_block *sb, struct assoofs_inode_info *inode_info);
+
 /*
  *  Operaciones sobre ficheros
  */
@@ -18,12 +20,76 @@ const struct file_operations assoofs_file_operations = {
 
 ssize_t assoofs_read(struct file * filp, char __user * buf, size_t len, loff_t * ppos) {
     printk(KERN_INFO "Read request\n");
-    return 0;
+
+    struct assoofs_inode_info *inode_info;
+    struct buffer_head *bh;
+    char *buffer;
+    int nbytes;
+
+    //Obtener la información persistente del inodo a partir de filp
+    inode_info = filp->f_path.dentry->d_inode->i_private;
+
+    //Comprobar el valor de ppos por si hemos alcanzado el final del fichero
+    if (*ppos >= inode_info->file_size) {
+        printk(KERN_INFO "We have reached the end of the file\n");
+        return 0;
+    }
+
+    //Accedemos al contenido del fichero
+    bh = sb_bread(filp->f_path.dentry->d_inode->i_sb, inode_info->data_block_number);
+    buffer = (char *)bh->b_data;  //En buffer tenemos el bloque de disco donde esta el fichero
+
+    if(!bh){
+        printk(KERN_ERR "The process of reading block number [%llu] have failed\n",inode_info->data_block_number);
+        return -1;
+    }
+
+    //Copiar en el buffer buf el contenido del fichero leı́do en el paso anterior con la función copy to user
+    nbytes = min((size_t) inode_info->file_size, len); // Hay que comparar len con el tamano del fichero por si llegamos al final del fichero
+    copy_to_user(buf, buffer, nbytes);
+
+    brelse(bh);
+    *ppos += nbytes;
+
+    return nbytes; //Sera len (pasado por el ususario) o tam fichero si este es menor que len
 }
 
 ssize_t assoofs_write(struct file * filp, const char __user * buf, size_t len, loff_t * ppos) {
     printk(KERN_INFO "Write request\n");
-    return 0;
+
+    struct assoofs_inode_info *inode_info;
+    struct buffer_head *bh;
+    struct super_block *sb;
+    char *buffer;
+
+    //Obtener la información persistente del inodo a partir de filp
+    inode_info = filp->f_path.dentry->d_inode->i_private;
+
+    sb=filp->f_path.dentry->d_inode->i_sb;
+
+    //Accedemos al contenido del fichero
+    bh = sb_bread(filp->f_path.dentry->d_inode->i_sb, inode_info->data_block_number);
+    buffer = (char *)bh->b_data;  //En buffer tenemos el bloque de disco donde esta el fichero
+
+    if(!bh){
+        printk(KERN_ERR "The process of reading block number [%llu] have failed\n",inode_info->data_block_number);
+        return -1;
+    }
+
+    buffer += *ppos;
+    copy_from_user(buffer, buf, len);  //Tenemos que escribir en el fichero los datos obtenidos de buf mediante copy_from_user
+
+    //Incrementamos len y marcamos bits
+    *ppos += len;
+    mark_buffer_dirty(bh);
+    sync_dirty_buffer(bh);
+    brelse(bh);
+
+    //Actualizar campo file_size de la info persistente del inodo
+    inode_info->file_size = *ppos;
+    assoofs_save_inode_info(sb, inode_info);  //Guardamos la info del nodo
+
+    return len;
 }
 
 /*
@@ -46,7 +112,6 @@ static int assoofs_iterate(struct file *filp, struct dir_context *ctx) {
     struct inode *inode;
     struct super_block *sb;
     struct buffer_head *bh;
-    loff_t pos;  //Long offset
     int i;
     struct assoofs_inode_info *inode_info;
     struct assoofs_dir_record_entry *record;
@@ -58,7 +123,7 @@ static int assoofs_iterate(struct file *filp, struct dir_context *ctx) {
     //Comprobar si el contexto del directorio ya está creado. Si no lo hacemos provocaremos un bucle infinito.
     //pos=ctx->pos;
     if (ctx->pos){ //Si es positivo, return 0
-        return 0;
+        return -1;
     } 
 
     //Hay que comprobar que el inodo obtenido en el paso 1 se corresponde con un directorio
@@ -186,6 +251,7 @@ struct dentry *assoofs_lookup(struct inode *parent_inode, struct dentry *child_d
     }
 
     printk(KERN_ERR "No inode found for the filename: [%s]\n", child_dentry->d_name.name);
+
     return NULL;
 }
 
@@ -225,7 +291,7 @@ int assoofs_save_inode_info(struct super_block *sb, struct assoofs_inode_info *i
     memcpy(inode_pos, inode_info, sizeof(*inode_pos));
     mark_buffer_dirty(bh);
     sync_dirty_buffer(bh);
-    //brelse(bh);
+    brelse(bh);
 
     return 0;
 }
@@ -551,10 +617,13 @@ static int __init assoofs_init(void) {
     // Control de errores a partir del valor de ret
     if(ret==0){
         printk(KERN_INFO "Successfully registered ASSOOFS!\n");
+
     }else{
         printk(KERN_ERR "Fail ocurred while registering ASSOOFS. Error:[%d]",ret);
-        return -1;
+        
     }
+
+    return ret;
 }
 
 static void __exit assoofs_exit(void) {
